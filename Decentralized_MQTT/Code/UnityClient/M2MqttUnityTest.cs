@@ -1,4 +1,4 @@
-﻿/*
+/*
 The MIT License (MIT)
 
 Copyright (c) 2018 Giovanni Paolo Vigano'
@@ -21,7 +21,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
-
+using System.Diagnostics;
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -48,6 +48,9 @@ using System.Threading.Tasks;
 using UnityEditor.Callbacks;
 using Newtonsoft.Json;
 using System.Security.Cryptography.X509Certificates;
+using System.Linq;
+using System.Diagnostics;
+using UnityEngine.Profiling;
 
 /// <summary>
 /// Examples for the M2MQTT library (https://github.com/eclipse/paho.mqtt.m2mqtt),
@@ -76,6 +79,8 @@ namespace M2MqttUnity.Examples
         public Button testPublishButton;
         public Button clearButton;
         public Button sendButton;
+        public Button requestTopicInfoButton;
+
 
         [Header("MQTT Settings")]
         [Tooltip("Topic to subscribe to")]
@@ -83,6 +88,8 @@ namespace M2MqttUnity.Examples
         public string targetDid;
 
         private IndyTest indyTest;
+        private DateTime sendMessageTime;
+        private DateTime receiveMessageTime;
 
         protected override void Start()
         {
@@ -91,6 +98,35 @@ namespace M2MqttUnity.Examples
             base.Start();
 
             indyTest = GetComponent<IndyTest>();
+            requestTopicInfoButton.onClick.AddListener(RequestTopicInfo);
+        }
+
+        private void FixedUpdate()
+        {
+            // 현재 시간 가져오기
+            string currentTime = System.DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+
+            // 현재 프레임에서의 CPU 사용량을 가져오기
+            float cpuUsage = Profiler.GetTotalAllocatedMemoryLong() / 1024f / 1024f;
+
+            // 현재 시간과 CPU 사용량 출력
+            UnityEngine.Debug.Log("CPU Usage: " + cpuUsage + " MB" + " time: " + currentTime);
+
+            // 현재 프레임에서의 메모리 사용량 가져오기
+            long memoryUsage = Profiler.GetMonoUsedSizeLong() / (1024 * 1024); // MB로 변환
+
+            // 현재 시간과 메모리 사용량 출력
+            UnityEngine.Debug.Log($"{currentTime} - 메모리 사용량: {memoryUsage} MB" + " time: " + currentTime);
+        }
+
+        private void RequestTopicInfo()
+        {
+            // 클라이언트가 요청 버튼을 눌렀을 때 브로커에게 토픽 정보를 요청하는 메시지를 발행
+            string requestMessage = "RequestingTopicInfo";
+            string requestTopic = "request_topic_info";
+
+            client.Publish(requestTopic, Encoding.UTF8.GetBytes(requestMessage), MqttMsgBase.QOS_LEVEL_EXACTLY_ONCE, false);
+            AddUiMessage("Requested topic information. Waiting for response...");
         }
 
         protected override void OnConnected()
@@ -99,6 +135,9 @@ namespace M2MqttUnity.Examples
             SetUiMessage("Connected to broker on " + brokerAddress + "\n");
 
             indyTest.StartIndy();
+
+            // 연결 후 requestTopicInfoButton 활성화
+            requestTopicInfoButton.interactable = true;
 
             if (autoTest)
             {
@@ -113,7 +152,7 @@ namespace M2MqttUnity.Examples
                 string message = messageInputField.text;
 
                 //sing message
-                string signedMessage = await indyTest.SignDataAsync(message);
+                //string signedMessage = await indyTest.SignDataAsync(message);
 
                 // is signed message
                 /*if(indyTest.VerifySignature(signedMessage, message))
@@ -131,85 +170,108 @@ namespace M2MqttUnity.Examples
                     {
                         client.Publish(i, Encoding.UTF8.GetBytes(message), MqttMsgBase.QOS_LEVEL_EXACTLY_ONCE, false);
 
+                        // 현재 프레임에서의 CPU 사용량을 가져오기
+                        float cpuUsage = Profiler.GetTotalAllocatedMemoryLong() / 1024f / 1024f;
+
+                        UnityEngine.Debug.Log("CPU Usage: " + cpuUsage + " MB");
+
+                        // 현재 프로세스의 메모리 사용량 가져오기
+                        Process process = Process.GetCurrentProcess();
+                        long memoryUsage = process.WorkingSet64;
+
+                        // 현재 메모리 사용량 출력
+                        UnityEngine.Debug.Log($"메모리 사용량: {memoryUsage / (1024 * 1024)} MB");
+
                         AddUiMessage("Message published.");
                     }
                 }
             }
         }
 
+
         protected override void DecodeMessage(string topic, byte[] message)
         {
-            /*foreach (string i in this.topic)
-            {
-                if (topic == i)
-                {
-                    if (autoTest)
-                    {
-                        autoTest = false;
-                        Disconnect();
-                    }
-                }
-            }*/
-
             string msg = System.Text.Encoding.UTF8.GetString(message);
-            Debug.Log("Received: " + msg);
 
+            if (topic == "request_topic_info_response")
+            {
+                // 브로커로부터 토픽 정보 응답을 받았을 때 처리
+                ProcessTopicInfoResponse(msg);
+            }
+            else
+            {
+                // 다른 토픽에 온 메시지 처리
+                StoreMessage(msg);
+                Task.Run(async () => await ProcessReceivedMessages(msg));
+            }
+        }
 
-            StoreMessage(msg);
-            ProcessReceivedMessage(msg);
-            // Process the received message
+        private void ProcessTopicInfoResponse(string response)
+        {
+            // 브로커로부터 받은 토픽 정보를 출력
+            AddUiMessage("Received topic information response: " + response);
         }
 
 
 
         [Serializable]
-        private class DeviceData
+        private struct DeviceData
         {
-            public string Distance;
-            public string Signature;
+            public string originData;
+            public string signData;
             public string Did;
         }
 
 
-        private async void ProcessReceivedMessage(string receivedMessage)
+        private async Task ProcessReceivedMessages(string receivedMessages)
         {
+
             try
             {
+                Stopwatch stopwatch = new Stopwatch();
+                stopwatch.Start();
+
                 // Deserialize the JSON message
-                var messageObject = JsonConvert.DeserializeObject<DeviceData>(receivedMessage);
+                var messageObject = JsonConvert.DeserializeObject<DeviceData>(receivedMessages);
 
                 // Extract the DID from the received message
                 string receivedDid = messageObject.Did;
 
-                Debug.Log("messageObject.Did: " + messageObject.Did);
-                Debug.Log("messageObject.Data: " + messageObject.Distance);
-                Debug.Log("messageObject.Signature: " + messageObject.Signature);
                 // Query the pool to get the public key associated with the received DID
                 string publicKey = await GetPublicKeyFromPoolAsync(receivedDid);
 
                 if (publicKey != null)
                 {
                     // using the public key, verify the signature of the received message
-                    bool isSignatureValid = await indyTest.VerifySignature(messageObject.Signature, messageObject.Distance, publicKey);
+                    bool isSignatureValid = await indyTest.VerifySignature(messageObject.signData, messageObject.originData, publicKey);
+
+                    // 서명 검증 종료 시간 기록
+                    stopwatch.Stop();
 
                     if (isSignatureValid)
                     {
-                        Debug.Log("Signature verification successful.");
+                        UnityEngine.Debug.Log("Signature verification successful.");
                     }
                     else
                     {
-                        Debug.Log("Signature verification failed.");
+                        UnityEngine.Debug.Log("Signature verification failed.");
                     }
                 }
                 else
                 {
-                    Debug.LogError("Failed to retrieve public key for the received DID from the pool.");
+                    UnityEngine.Debug.LogError("Failed to retrieve public key for the received DID from the pool.");
                 }
+
+                // 측정된 시간 출력
+                TimeSpan elapsed = stopwatch.Elapsed;
+                UnityEngine.Debug.Log($"서명 검증 시간: {elapsed.TotalSeconds} 초");
             }
+
             catch (Exception ex)
             {
-                Debug.LogError($"Error processing received message: {ex.Message}");
+                UnityEngine.Debug.LogError($"Error processing received message: {ex.Message}");
             }
+
         }
 
         private async Task<string> GetPublicKeyFromPoolAsync(string did)
@@ -222,17 +284,18 @@ namespace M2MqttUnity.Examples
                 // Get the public key from the pool
                 var keyForDidResult = await Did.KeyForDidAsync(indyTest.pool_handle, indyTest.wallet_handle, did);
 
-                Debug.Log("Device did: " + did);
-                Debug.Log("publicKey: " + keyForDidResult);
+                UnityEngine.Debug.Log("Device did: " + did);
+                UnityEngine.Debug.Log("publicKey: " + keyForDidResult);
 
                 return keyForDidResult;
             }
             catch (Exception ex)
             {
-                Debug.LogError($"Error getting public key from the pool: {ex.Message}");
+                UnityEngine.Debug.LogError($"Error getting public key from the pool: {ex.Message}");
                 return null;
             }
         }
+
 
 
 
@@ -252,7 +315,7 @@ namespace M2MqttUnity.Examples
             foreach (string i in topic)
             {
                 client.Publish(i, System.Text.Encoding.UTF8.GetBytes("Test message"), MqttMsgBase.QOS_LEVEL_EXACTLY_ONCE, false);
-                Debug.Log("Test message published");
+                UnityEngine.Debug.Log("Test message published");
                 AddUiMessage("Test message published.");
             }
         }
@@ -276,7 +339,7 @@ namespace M2MqttUnity.Examples
         public void SetEncrypted(bool isEncrypted)
         {
             this.isEncrypted = isEncrypted;
-            Debug.Log("isEncrypted: " + isEncrypted);
+            UnityEngine.Debug.Log("isEncrypted: " + isEncrypted);
         }
 
 
